@@ -1565,6 +1565,60 @@
         // コンパス描画
         drawCompass(centerAzimuth, fov);
 
+        // 北極星キラリアニメーション
+        const polaris = StarDatabase.getStarById('HIP11767');
+        if (polaris) {
+          const polarisH = CelestialEngine.equatorialToHorizontal(polaris.ra, polaris.dec, datetime);
+          if (polarisH.altitude > 0 && isWithinViewport(polarisH.azimuth, polarisH.altitude, centerAzimuth, centerAltitude, fov)) {
+            const polarisPos = convertHorizontalToCanvas(polarisH.azimuth, polarisH.altitude, centerAzimuth, centerAltitude, fov);
+            const now = Date.now();
+            const t = (now % 3000) / 3000;
+            // 急峻なスパイク（一瞬だけキラッ）
+            const spike = Math.pow(Math.max(0, Math.sin(t * Math.PI * 2)), 16);
+
+            if (spike > 0.01) {
+              ctx.save();
+              const x = polarisPos.x;
+              const y = polarisPos.y;
+
+              // 細い光条（4方向）
+              const len = 4 + spike * 20;
+              const grad = ctx.createRadialGradient(x, y, 0, x, y, len);
+              grad.addColorStop(0, `rgba(255,255,255,${spike * 0.9})`);
+              grad.addColorStop(0.3, `rgba(200,220,255,${spike * 0.5})`);
+              grad.addColorStop(1, 'rgba(255,255,255,0)');
+
+              ctx.strokeStyle = grad;
+              ctx.lineWidth = 1 + spike * 0.5;
+              ctx.lineCap = 'round';
+
+              ctx.beginPath();
+              ctx.moveTo(x - len, y);
+              ctx.lineTo(x + len, y);
+              ctx.stroke();
+
+              ctx.beginPath();
+              ctx.moveTo(x, y - len);
+              ctx.lineTo(x, y + len);
+              ctx.stroke();
+
+              // 斜め光条（短め）
+              const len2 = len * 0.5;
+              ctx.lineWidth = 0.5 + spike * 0.3;
+              ctx.beginPath();
+              ctx.moveTo(x - len2 * 0.7, y - len2 * 0.7);
+              ctx.lineTo(x + len2 * 0.7, y + len2 * 0.7);
+              ctx.stroke();
+              ctx.beginPath();
+              ctx.moveTo(x + len2 * 0.7, y - len2 * 0.7);
+              ctx.lineTo(x - len2 * 0.7, y + len2 * 0.7);
+              ctx.stroke();
+
+              ctx.restore();
+            }
+          }
+        }
+
         // 選択された星の名前を表示
         if (selectedStar && selectedStarPos) {
           drawStarLabel(selectedStarPos.x, selectedStarPos.y, selectedStar.name, selectedStar.mag);
@@ -1743,7 +1797,7 @@
       let screenWidth = 400;
       let screenHeight = 400;
 
-      const FOV_MIN = 5;
+      const FOV_MIN = 5; // より深いズームを許可
       const FOV_MAX = 100;
 
       // ダブルタップ用の状態
@@ -2319,6 +2373,13 @@
 
         // 初期描画
         requestRender();
+
+        // 北極星アニメーション用ループ
+        function animatePolaris() {
+          requestRender();
+          requestAnimationFrame(animatePolaris);
+        }
+        animatePolaris();
 
         console.log('Application initialized successfully.');
         return true;
