@@ -1132,6 +1132,7 @@
       const RAD_TO_DEG = 180 / Math.PI;
 
       // 視野内判定（角距離ベース）
+      // fovは縦方向のFOV、横方向はアスペクト比で広がる
       function isWithinViewport(azimuth, altitude, centerAzimuth, centerAltitude, fov) {
         const az1 = azimuth * DEG_TO_RAD;
         const alt1 = altitude * DEG_TO_RAD;
@@ -1143,12 +1144,17 @@
                            Math.cos(alt0) * Math.cos(alt1) * Math.cos(az1 - az0);
         const angDist = Math.acos(Math.max(-1, Math.min(1, cosAngDist))) * RAD_TO_DEG;
 
-        return angDist <= fov / 2 * 1.2;
+        // 横方向のFOVを考慮（アスペクト比で広がる）
+        const aspectRatio = canvasWidth / canvasHeight;
+        const effectiveFov = fov * Math.max(1, aspectRatio);
+
+        return angDist <= effectiveFov / 2 * 1.2;
       }
 
       // 透視投影（Perspective Projection）
       // 窓から外を見たときの自然な見え方を再現
       // カメラや人の目と同じ投影法
+      // fovは縦方向（高度角）のFOVを表す
       function convertHorizontalToCanvas(azimuth, altitude, centerAzimuth, centerAltitude, fov) {
         const az = azimuth * DEG_TO_RAD;
         const alt = altitude * DEG_TO_RAD;
@@ -1171,14 +1177,54 @@
         const projY = y / z;
 
         // FOVに基づくスケーリング
-        // 透視投影では、FOVの端が画面端に来るようにスケール
+        // 縦方向のFOVを基準に、縦方向のスケールを決定
         const halfFovRad = (fov / 2) * DEG_TO_RAD;
-        const scale = Math.min(canvasWidth, canvasHeight) / 2 / Math.tan(halfFovRad);
+        const scaleY = canvasHeight / 2 / Math.tan(halfFovRad);
+        // 横方向も同じスケールを使用（ピクセルが正方形なので）
+        const scaleX = scaleY;
 
-        const canvasX = canvasWidth / 2 + projX * scale;
-        const canvasY = canvasHeight / 2 - projY * scale;
+        const canvasX = canvasWidth / 2 + projX * scaleX;
+        const canvasY = canvasHeight / 2 - projY * scaleY;
 
         return { x: canvasX, y: canvasY };
+      }
+
+      // Canvas座標から方位角・高度角へ逆変換
+      // fovは縦方向（高度角）のFOVを表す
+      function convertCanvasToHorizontal(canvasX, canvasY, centerAzimuth, centerAltitude, fov) {
+        const halfFovRad = (fov / 2) * DEG_TO_RAD;
+        const scaleY = canvasHeight / 2 / Math.tan(halfFovRad);
+        const scaleX = scaleY; // ピクセルが正方形なので同じスケール
+
+        // Canvas中心からのオフセット
+        const projX = (canvasX - canvasWidth / 2) / scaleX;
+        const projY = -(canvasY - canvasHeight / 2) / scaleY;
+
+        // 逆透視投影: z=1として3D座標を復元
+        const x = projX;
+        const y = projY;
+        const z = 1;
+        const len = Math.sqrt(x * x + y * y + z * z);
+        const nx = x / len;
+        const ny = y / len;
+        const nz = z / len;
+
+        // 視線座標系から地平座標系へ逆変換
+        const az0 = centerAzimuth * DEG_TO_RAD;
+        const alt0 = centerAltitude * DEG_TO_RAD;
+
+        const sinAlt0 = Math.sin(alt0);
+        const cosAlt0 = Math.cos(alt0);
+
+        // 逆回転行列を適用
+        const altitude = Math.asin(cosAlt0 * ny + sinAlt0 * nz);
+        const azimuthOffset = Math.atan2(nx, cosAlt0 * nz - sinAlt0 * ny);
+        const azimuth = (az0 + azimuthOffset) * RAD_TO_DEG;
+
+        return {
+          azimuth: ((azimuth % 360) + 360) % 360,
+          altitude: altitude * RAD_TO_DEG
+        };
       }
 
       function drawStar(x, y, size, color = 'white') {
@@ -1335,7 +1381,11 @@
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
 
-        const halfFov = fov / 2;
+        // 横方向のFOVを計算（縦FOVとアスペクト比から）
+        const aspectRatio = canvasWidth / canvasHeight;
+        const halfFovRad = (fov / 2) * Math.PI / 180;
+        const horizontalHalfFovRad = Math.atan(Math.tan(halfFovRad) * aspectRatio);
+        const horizontalHalfFov = horizontalHalfFovRad * 180 / Math.PI;
 
         directions.forEach(dir => {
           // 現在の視野中心からの角度差を計算
@@ -1344,8 +1394,8 @@
           if (azDiff < -180) azDiff += 360;
 
           // 視野内かどうか
-          if (Math.abs(azDiff) <= halfFov) {
-            const x = canvasWidth / 2 + (azDiff / halfFov) * (canvasWidth / 2);
+          if (Math.abs(azDiff) <= horizontalHalfFov) {
+            const x = canvasWidth / 2 + (azDiff / horizontalHalfFov) * (canvasWidth / 2);
 
             // 主要方位（N, E, S, W）は大きく表示
             const isCardinal = dir.az % 90 === 0;
@@ -1647,6 +1697,7 @@
         clearCanvas,
         isWithinViewport,
         convertHorizontalToCanvas,
+        convertCanvasToHorizontal,
         renderSkyCanvas,
         getCanvasSize,
         selectStar
@@ -1672,9 +1723,39 @@
         rafId: null
       };
 
+      // ピンチズーム用の状態
+      let pinchState = {
+        active: false,
+        pointers: new Map(), // pointerId -> {x, y}
+        initialDistance: 0,
+        initialFov: 90,
+        initialAzimuth: 180,
+        initialAltitude: 50,
+        centerAzimuth: 180, // ピンチ中心の方位角
+        centerAltitude: 50  // ピンチ中心の高度角
+      };
+
+      let canvasElement = null; // canvas要素への参照
+
       let currentAzimuth = 180; // 南向き
-      let fov = 90;
+      let currentAltitude = 50; // 高度角（水平線0°〜天頂90°の中間あたり）
+      let fov = 100; // 縦方向のFOV（水平線〜天頂超え）
       let screenWidth = 400;
+      let screenHeight = 400;
+
+      const FOV_MIN = 40;
+      const FOV_MAX = 100;
+
+      // ダブルタップ用の状態
+      let lastTapTime = 0;
+      let lastTapX = 0;
+      let lastTapY = 0;
+      const DOUBLE_TAP_DELAY = 300; // ms
+      const DOUBLE_TAP_DISTANCE = 30; // px
+
+      // ズームレベル: 0=通常(100°), 1=中間(70°), 2=最大(40°)
+      const ZOOM_LEVELS = [100, 70, 40];
+      let currentZoomLevel = 0;
 
       const INERTIA_DECAY = 3.0;
       const INERTIA_START_THRESHOLD = 50;
@@ -1687,7 +1768,11 @@
       }
 
       function calculateDeltaAzimuth(deltaX) {
-        return -deltaX * (fov / screenWidth);
+        // 横方向のFOVを計算（縦FOVとアスペクト比から）
+        const aspectRatio = screenWidth / screenHeight;
+        const halfFovRad = (fov / 2) * Math.PI / 180;
+        const horizontalFov = 2 * Math.atan(Math.tan(halfFovRad) * aspectRatio) * 180 / Math.PI;
+        return -deltaX * (horizontalFov / screenWidth);
       }
 
       function emitAzimuthChanged() {
@@ -1696,7 +1781,66 @@
         }));
       }
 
+      function emitAltitudeChanged() {
+        window.dispatchEvent(new CustomEvent('view:altitudeChanged', {
+          detail: { altitude: currentAltitude }
+        }));
+      }
+
+      function getPointerDistance() {
+        const pointers = Array.from(pinchState.pointers.values());
+        if (pointers.length < 2) return 0;
+        const dx = pointers[1].x - pointers[0].x;
+        const dy = pointers[1].y - pointers[0].y;
+        return Math.sqrt(dx * dx + dy * dy);
+      }
+
+      function getPointerCenter() {
+        const pointers = Array.from(pinchState.pointers.values());
+        if (pointers.length < 2) return null;
+        return {
+          x: (pointers[0].x + pointers[1].x) / 2,
+          y: (pointers[0].y + pointers[1].y) / 2
+        };
+      }
+
+      function emitFovChanged() {
+        window.dispatchEvent(new CustomEvent('view:fovChanged', {
+          detail: { fov: fov }
+        }));
+      }
+
       function handlePointerDown(event) {
+        // ポインターを記録
+        pinchState.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+        if (pinchState.pointers.size === 2) {
+          // 2本指になったらピンチモード開始
+          pinchState.active = true;
+          pinchState.initialDistance = getPointerDistance();
+          pinchState.initialFov = fov;
+          pinchState.initialAzimuth = currentAzimuth;
+          pinchState.initialAltitude = currentAltitude;
+
+          // ピンチ中心の方位角・高度角を計算
+          const center = getPointerCenter();
+          if (center && canvasElement) {
+            const rect = canvasElement.getBoundingClientRect();
+            const canvasX = center.x - rect.left;
+            const canvasY = center.y - rect.top;
+            const viewParams = ApplicationIntegrator.getViewParams();
+            const pos = CanvasRenderingEngine.convertCanvasToHorizontal(
+              canvasX, canvasY,
+              viewParams.centerAzimuth, viewParams.centerAltitude, viewParams.fov
+            );
+            pinchState.centerAzimuth = pos.azimuth;
+            pinchState.centerAltitude = pos.altitude;
+          }
+
+          dragState.active = false; // ドラッグをキャンセル
+          return;
+        }
+
         if (inertiaState.active) {
           cancelAnimationFrame(inertiaState.rafId);
           inertiaState.active = false;
@@ -1714,6 +1858,55 @@
       }
 
       function handlePointerMove(event) {
+        // ピンチモード中
+        if (pinchState.active && pinchState.pointers.has(event.pointerId)) {
+          pinchState.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+          if (pinchState.pointers.size === 2) {
+            const currentDistance = getPointerDistance();
+            if (pinchState.initialDistance > 0) {
+              const scale = currentDistance / pinchState.initialDistance;
+              // ピンチアウト（広げる）→ FOV小さく（ズームイン）
+              // ピンチイン（縮める）→ FOV大きく（ズームアウト）
+              const newFov = pinchState.initialFov / scale;
+              fov = Math.max(FOV_MIN, Math.min(FOV_MAX, newFov));
+
+              // ピンチ中心が画面上で動かないように視点を調整
+              const center = getPointerCenter();
+              if (center && canvasElement) {
+                const rect = canvasElement.getBoundingClientRect();
+                const centerX = center.x - rect.left - rect.width / 2;
+                const centerY = center.y - rect.top - rect.height / 2;
+
+                // FOV変化による拡大率
+                const oldHalfFovRad = (pinchState.initialFov / 2) * Math.PI / 180;
+                const newHalfFovRad = (fov / 2) * Math.PI / 180;
+                const zoomFactor = Math.tan(oldHalfFovRad) / Math.tan(newHalfFovRad);
+
+                // ピンチ中心が画面上で同じ位置に留まるよう、視点をずらす
+                const scaleY = rect.height / 2 / Math.tan(oldHalfFovRad);
+                const offsetX = centerX / scaleY * (1 - 1 / zoomFactor);
+                const offsetY = -centerY / scaleY * (1 - 1 / zoomFactor);
+
+                // 方位角と高度角の調整量を計算
+                const deltaAz = Math.atan(offsetX) * 180 / Math.PI;
+                const deltaAlt = Math.atan(offsetY) * 180 / Math.PI;
+
+                currentAzimuth = normalizeAzimuth(pinchState.initialAzimuth + deltaAz);
+                currentAltitude = Math.max(0, Math.min(90, pinchState.initialAltitude + deltaAlt));
+                emitAzimuthChanged();
+                emitAltitudeChanged();
+              }
+
+              // ズームレベルを現在のFOVに近い値に同期
+              currentZoomLevel = ZOOM_LEVELS.findIndex(z => z <= fov);
+              if (currentZoomLevel === -1) currentZoomLevel = ZOOM_LEVELS.length - 1;
+              emitFovChanged();
+            }
+          }
+          return;
+        }
+
         if (!dragState.active) return;
 
         const now = performance.now();
@@ -1740,6 +1933,17 @@
       }
 
       function handlePointerUp(event) {
+        // ポインターを削除
+        pinchState.pointers.delete(event.pointerId);
+
+        // ピンチモード終了判定
+        if (pinchState.active) {
+          if (pinchState.pointers.size < 2) {
+            pinchState.active = false;
+          }
+          return;
+        }
+
         if (!dragState.active) return;
 
         dragState.active = false;
@@ -1752,6 +1956,80 @@
 
         // タップ判定: 移動量が10px未満かつ300ms以内
         if (totalDistance < 10 && duration < 300) {
+          const tapX = event.clientX;
+          const tapY = event.clientY;
+
+          // ダブルタップ判定
+          const timeSinceLastTap = now - lastTapTime;
+          const distFromLastTap = Math.sqrt(
+            Math.pow(tapX - lastTapX, 2) + Math.pow(tapY - lastTapY, 2)
+          );
+
+          if (timeSinceLastTap < DOUBLE_TAP_DELAY && distFromLastTap < DOUBLE_TAP_DISTANCE) {
+            // ダブルタップ検出 → ズーム切り替え
+            const canvas = event.target;
+            const rect = canvas.getBoundingClientRect();
+            const canvasX = tapX - rect.left;
+            const canvasY = tapY - rect.top;
+
+            // タップ位置の方位角・高度角を取得
+            const viewParams = ApplicationIntegrator.getViewParams();
+            const tapPos = CanvasRenderingEngine.convertCanvasToHorizontal(
+              canvasX, canvasY,
+              viewParams.centerAzimuth, viewParams.centerAltitude, viewParams.fov
+            );
+
+            if (currentZoomLevel >= ZOOM_LEVELS.length - 1) {
+              // 最大ズーム → 元に戻す（初期位置に戻る）
+              currentZoomLevel = 0;
+              currentAltitude = 50; // 初期高度に戻す
+              emitAltitudeChanged();
+              fov = ZOOM_LEVELS[currentZoomLevel];
+              emitFovChanged();
+            } else {
+              // 次のズームレベルへ
+              currentZoomLevel++;
+              const newFov = ZOOM_LEVELS[currentZoomLevel];
+
+              // タップ位置が画面上で動かないように視点を調整
+              // タップ位置のCanvas座標での相対位置を維持
+              const centerX = canvasX - rect.width / 2;
+              const centerY = canvasY - rect.height / 2;
+
+              // FOV変化による拡大率
+              const oldHalfFovRad = (viewParams.fov / 2) * Math.PI / 180;
+              const newHalfFovRad = (newFov / 2) * Math.PI / 180;
+              const zoomFactor = Math.tan(oldHalfFovRad) / Math.tan(newHalfFovRad);
+
+              // タップ位置が画面上で同じ位置に留まるよう、視点をずらす
+              // ずらす量 = タップ位置の中心からのオフセット × (1 - 1/zoomFactor)
+              const scaleY = rect.height / 2 / Math.tan(oldHalfFovRad);
+              const offsetX = centerX / scaleY * (1 - 1 / zoomFactor);
+              const offsetY = -centerY / scaleY * (1 - 1 / zoomFactor);
+
+              // 方位角と高度角の調整量を計算
+              const deltaAz = Math.atan(offsetX) * 180 / Math.PI;
+              const deltaAlt = Math.atan(offsetY) * 180 / Math.PI;
+
+              currentAzimuth = normalizeAzimuth(currentAzimuth + deltaAz);
+              currentAltitude = Math.max(0, Math.min(90, currentAltitude + deltaAlt));
+
+              fov = newFov;
+              emitAzimuthChanged();
+              emitAltitudeChanged();
+              emitFovChanged();
+            }
+
+            // ダブルタップ状態をリセット
+            lastTapTime = 0;
+            return;
+          }
+
+          // シングルタップとして記録
+          lastTapTime = now;
+          lastTapX = tapX;
+          lastTapY = tapY;
+
           // canvas座標に変換（CSS座標系、DPR補正不要）
           const canvas = event.target;
           const rect = canvas.getBoundingClientRect();
@@ -1816,16 +2094,22 @@
         inertiaState.rafId = requestAnimationFrame(runInertiaFrame);
       }
 
-      function setViewParameters(newFov, newScreenWidth) {
+      function setViewParameters(newFov, newScreenWidth, newScreenHeight) {
         fov = newFov;
         screenWidth = newScreenWidth;
+        screenHeight = newScreenHeight || newScreenWidth;
       }
 
       function getCurrentAzimuth() {
         return currentAzimuth;
       }
 
+      function getCurrentFov() {
+        return fov;
+      }
+
       function initializePanoramaControl(canvas) {
+        canvasElement = canvas; // canvas要素を保存
         canvas.addEventListener('pointerdown', handlePointerDown);
         canvas.addEventListener('pointermove', handlePointerMove);
         canvas.addEventListener('pointerup', handlePointerUp);
@@ -1837,6 +2121,7 @@
         initializePanoramaControl,
         setViewParameters,
         getCurrentAzimuth,
+        getCurrentFov,
         normalizeAzimuth
       };
     })();
@@ -1864,23 +2149,15 @@
       }
 
       function calculateCanvasSize(displayMode, vw, vh) {
-        let size;
+        // 画面全体を使用（日時表示のスペースを少し確保）
+        const headerHeight = 80; // 日時表示のスペース
+        const width = vw;
+        const height = vh - headerHeight;
 
-        switch (displayMode) {
-          case 'smartphone':
-            size = Math.min(vw - 16, vh - 200);
-            break;
-          case 'tablet':
-            size = Math.min(vw - 32, vh - 200, 800);
-            break;
-          case 'desktop':
-            size = Math.min(vw - 64, vh - 200, 1000);
-            break;
-          default:
-            size = Math.min(vw, vh) - 32;
-        }
-
-        return Math.max(size, 300);
+        return {
+          width: Math.max(width, 300),
+          height: Math.max(height, 300)
+        };
       }
 
       function applyLayout() {
@@ -1889,15 +2166,15 @@
         const canvasSize = calculateCanvasSize(displayMode, viewport.width, viewport.height);
 
         const canvas = document.getElementById('starfield-canvas');
-        CanvasRenderingEngine.initializeCanvasEngine(canvas, canvasSize, canvasSize);
+        CanvasRenderingEngine.initializeCanvasEngine(canvas, canvasSize.width, canvasSize.height);
 
-        PanoramaViewController.setViewParameters(90, canvasSize);
+        PanoramaViewController.setViewParameters(100, canvasSize.width, canvasSize.height); // 縦FOV 100°
 
         window.dispatchEvent(new CustomEvent('layout:changed', {
           detail: {
             displayMode,
-            canvasWidth: canvasSize,
-            canvasHeight: canvasSize
+            canvasWidth: canvasSize.width,
+            canvasHeight: canvasSize.height
           }
         }));
 
@@ -1934,8 +2211,8 @@
     const ApplicationIntegrator = (function() {
       let viewParams = {
         centerAzimuth: 180,
-        centerAltitude: 45,
-        fov: 90
+        centerAltitude: 50, // 水平線(0°)から天頂超え(100°)の中心
+        fov: 100 // 縦方向のFOV（水平線〜天頂超え）
       };
 
       let renderPending = false;
@@ -2018,6 +2295,16 @@
           requestRender();
         });
 
+        window.addEventListener('view:altitudeChanged', (e) => {
+          viewParams.centerAltitude = e.detail.altitude;
+          requestRender();
+        });
+
+        window.addEventListener('view:fovChanged', (e) => {
+          viewParams.fov = e.detail.fov;
+          requestRender();
+        });
+
         window.addEventListener('layout:changed', (e) => {
           requestRender();
         });
@@ -2037,10 +2324,15 @@
         return true;
       }
 
+      function getViewParams() {
+        return viewParams;
+      }
+
       return {
         initializeApplication,
         detectCanvasSupport,
-        requestRender
+        requestRender,
+        getViewParams
       };
     })();
 
